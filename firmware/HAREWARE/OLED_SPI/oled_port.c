@@ -1,158 +1,199 @@
+/* SPDX-License-Identifier: MPL-2.0
+ * I2C adaptation of the OLED port from Sheep118/WouoUI-PageVersion.
+ * Upstream: https://github.com/Sheep118/WouoUI-PageVersion
+ * Transport: STM32F103 I2C1, PB6=SCL, PB7=SDA, 3.3 V module supply.
+ * The directory may retain its original OLED_SPI name for this first change.
+ */
 #include "oled_port.h"
-#include "string.h"
 #include "stm32f10x.h"
 #include "main.h"
 
-#define  SCL_PORT   GPIOA
-#define  SCL_PIN	GPIO_Pin_5
-#define  SDA_PORT   GPIOA
-#define	 SDA_PIN	GPIO_Pin_7 
-#define  RES_PORT   GPIOB
-#define  RES_PIN    GPIO_Pin_0
-#define  DC_PORT    GPIOB
-#define  DC_PIN     GPIO_Pin_1
+#if OLED_DRIVER != SSD1306 && OLED_DRIVER != SH1106
+#error Unsupported OLED_DRIVER
+#endif
 
-#define OLED_CMD 	0
-#define OLED_DATA 	1
+#define OLED_I2C_TIMEOUT_LOOPS 50000UL
+#define OLED_CONTROL_COMMAND  0x00U
+#define OLED_CONTROL_DATA     0x40U
 
-void delay(uint8_t i)
+static uint8_t oled_ready = 0;
+static uint8_t oled_address = 0;
+static uint8_t oled_error = OLED_ERROR_NOT_INITIALIZED;
+
+static void OLED_StopTransfer(void)
 {
-    i = i*5;
-    while(i--){}
+    I2C_GenerateSTOP(I2C1, ENABLE);
+    I2C_ClearFlag(I2C1, I2C_FLAG_AF | I2C_FLAG_BERR |
+                        I2C_FLAG_ARLO | I2C_FLAG_OVR);
 }
 
-static void OLED_RES_Set(void)
+static uint8_t OLED_WaitEvent(uint32_t event)
 {
-  GPIO_WriteBit(RES_PORT, RES_PIN, Bit_SET);
-}
-static void OLED_DC_Set(void)
-{
-  GPIO_WriteBit(DC_PORT , DC_PIN, Bit_SET);
-}
-static void OLED_RES_Clr(void)
-{
-  GPIO_WriteBit(RES_PORT, RES_PIN, Bit_RESET);
-}
-static void OLED_DC_Clr(void)
-{
-  GPIO_WriteBit(DC_PORT, DC_PIN, Bit_RESET);
-}
-
-
-static void OLED_SPIRstDCPinInit(void)
-{
-  GPIO_InitTypeDef GPIO_InitStructure;	
-  RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOB,ENABLE);//GPIOB
-	GPIO_InitStructure.GPIO_Mode=GPIO_Mode_Out_PP;
-	GPIO_InitStructure.GPIO_Pin= DC_PIN|RES_PIN;
-	GPIO_InitStructure.GPIO_Speed=GPIO_Speed_50MHz;
-	GPIO_Init(DC_PORT, &GPIO_InitStructure);
-
-  RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOA,ENABLE);//GPIOA
-  GPIO_InitStructure.GPIO_Pin = SCL_PIN | SDA_PIN ;
-  GPIO_InitStructure.GPIO_Mode = GPIO_Mode_AF_PP;
-  GPIO_InitStructure.GPIO_Speed = GPIO_Speed_50MHz;
-  GPIO_Init(SCL_PORT, &GPIO_InitStructure);
-}
-
-
-static void OLED_WriteByte(uint8_t dat, uint8_t cORd)
-{
-    if(cORd) OLED_DC_Set();
-    else OLED_DC_Clr();
-    /* Loop while DR register in not emplty */
-    while (SPI_I2S_GetFlagStatus(SPI1, SPI_I2S_FLAG_TXE) == RESET);
-    /* Send byte through the SPI1 peripheral */
-    SPI_I2S_SendData(SPI1, dat);
-    delay(5);
-    OLED_DC_Set();
-}
-
-static void OLED_WriteByteArrayData(uint8_t * data_array,uint16_t len)
-{
-    OLED_DC_Set();
-    for(uint8_t i = 0; i < len; i++)
-    {
-        /* Loop while DR register in not emplty */
-        while (SPI_I2S_GetFlagStatus(SPI1, SPI_I2S_FLAG_TXE) == RESET);
-        /* Send byte through the SPI1 peripheral */
-        SPI_I2S_SendData(SPI1, data_array[i]);
-        delay(5);
+    uint32_t remaining = OLED_I2C_TIMEOUT_LOOPS;
+    for (;;) {
+        if (I2C_GetFlagStatus(I2C1, I2C_FLAG_AF) == SET) {
+            oled_error = OLED_ERROR_NO_ACK;
+            return 0;
+        }
+        if ((I2C1->SR1 & (I2C_SR1_BERR | I2C_SR1_ARLO | I2C_SR1_OVR)) != 0) {
+            oled_error = OLED_ERROR_BUS;
+            return 0;
+        }
+        if (I2C_CheckEvent(I2C1, event) == SUCCESS) {
+            return 1;
+        }
+        if (--remaining == 0) {
+            oled_error = OLED_ERROR_TIMEOUT;
+            return 0;
+        }
     }
 }
 
+static uint8_t OLED_StartWrite(uint8_t address)
+{
+    uint32_t remaining = OLED_I2C_TIMEOUT_LOOPS;
+    oled_error = OLED_ERROR_NONE;
+    while (I2C_GetFlagStatus(I2C1, I2C_FLAG_BUSY) == SET) {
+        if (--remaining == 0) {
+            oled_error = OLED_ERROR_BUS_BUSY;
+            return 0;
+        }
+    }
+    I2C_ClearFlag(I2C1, I2C_FLAG_AF | I2C_FLAG_BERR |
+                        I2C_FLAG_ARLO | I2C_FLAG_OVR);
+    I2C_GenerateSTART(I2C1, ENABLE);
+    if (!OLED_WaitEvent(I2C_EVENT_MASTER_MODE_SELECT)) {
+        OLED_StopTransfer();
+        return 0;
+    }
+    /* SPL expects the seven-bit address shifted left by one bit. */
+    I2C_Send7bitAddress(I2C1, (uint8_t)(address << 1), I2C_Direction_Transmitter);
+    if (!OLED_WaitEvent(I2C_EVENT_MASTER_TRANSMITTER_MODE_SELECTED)) {
+        OLED_StopTransfer();
+        return 0;
+    }
+    return 1;
+}
+
+static uint8_t OLED_SendByte(uint8_t value)
+{
+    I2C_SendData(I2C1, value);
+    /* Wait for BTF before issuing STOP, including for the final byte. */
+    return OLED_WaitEvent(I2C_EVENT_MASTER_BYTE_TRANSMITTED);
+}
+
+static uint8_t OLED_WriteBuffer(uint8_t control, const uint8_t *data, uint16_t length)
+{
+    uint16_t index;
+    if (!OLED_StartWrite(oled_address)) {
+        return 0;
+    }
+    if (!OLED_SendByte(control)) {
+        OLED_StopTransfer();
+        return 0;
+    }
+    for (index = 0; index < length; ++index) {
+        if (!OLED_SendByte(data[index])) {
+            OLED_StopTransfer();
+            return 0;
+        }
+    }
+    OLED_StopTransfer();
+    return 1;
+}
+
+static void OLED_I2CInit(void)
+{
+    GPIO_InitTypeDef pins;
+    I2C_InitTypeDef bus;
+
+    RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOB, ENABLE);
+    RCC_APB1PeriphClockCmd(RCC_APB1Periph_I2C1, ENABLE);
+    I2C_DeInit(I2C1);
+
+    GPIO_StructInit(&pins);
+    pins.GPIO_Pin = GPIO_Pin_6 | GPIO_Pin_7;
+    pins.GPIO_Mode = GPIO_Mode_AF_OD;
+    pins.GPIO_Speed = GPIO_Speed_50MHz;
+    GPIO_Init(GPIOB, &pins);
+
+    I2C_StructInit(&bus);
+    bus.I2C_ClockSpeed = OLED_I2C_CLOCK_HZ;
+    bus.I2C_Mode = I2C_Mode_I2C;
+    bus.I2C_DutyCycle = I2C_DutyCycle_2;
+    bus.I2C_OwnAddress1 = 0;
+    bus.I2C_Ack = I2C_Ack_Enable;
+    bus.I2C_AcknowledgedAddress = I2C_AcknowledgedAddress_7bit;
+    I2C_Init(I2C1, &bus);
+    I2C_Cmd(I2C1, ENABLE);
+}
 
 void OLED_Init(void)
-{   
-    OLED_SPIRstDCPinInit(); 
-    
-    RCC_APB2PeriphClockCmd( RCC_APB2Periph_SPI1, ENABLE);
-    SPI_InitTypeDef  SPI_InitStructure;
-    SPI_SSOutputCmd(SPI1, ENABLE);
-    SPI_InitStructure.SPI_Direction = SPI_Direction_2Lines_FullDuplex;
-    SPI_InitStructure.SPI_Mode = SPI_Mode_Master;
-    SPI_InitStructure.SPI_DataSize = SPI_DataSize_8b;
-    SPI_InitStructure.SPI_CPOL = SPI_CPOL_Low;
-    SPI_InitStructure.SPI_CPHA = SPI_CPHA_1Edge;
-    SPI_InitStructure.SPI_NSS = SPI_NSS_Soft;
-    SPI_InitStructure.SPI_BaudRatePrescaler = SPI_BaudRatePrescaler_16;
-    SPI_InitStructure.SPI_FirstBit = SPI_FirstBit_MSB;
-    SPI_InitStructure.SPI_CRCPolynomial = 7;
-    SPI_Init(SPI1, &SPI_InitStructure);
-    SPI_Cmd(SPI1, ENABLE);
-    
-    delay_ms(300);
-    OLED_RES_Clr();
-    delay_ms(300);
-    OLED_RES_Set();
-
-    OLED_WriteByte(0xAE,OLED_CMD);//--turn off oled panel
-#if (OLED_DRIVER == SSD1306)
-    OLED_WriteByte(0x00,OLED_CMD);//---set low column address
-#elif (OLED_DRIVER == SH1106)
-    OLED_WriteByte(0x02,OLED_CMD);//---set low column address
+{
+    static const uint8_t commands[] = {
+        0xAE,             /* Display off. */
+        0xD5, 0x80,       /* Display clock. */
+        0xA8, 0x3F,       /* 64 display rows. */
+        0xD3, 0x00,       /* Display offset. */
+        0x40,             /* Start line zero. */
+#if OLED_DRIVER == SSD1306
+        0x8D, 0x14,       /* SSD1306 internal charge pump. */
+        0x20, 0x02,       /* Page addressing. */
+#else
+        0xAD, 0x8B,       /* SH1106 DC-DC converter. */
 #endif
-    OLED_WriteByte(0x10,OLED_CMD);//---set high column address
-    OLED_WriteByte(0x40,OLED_CMD);//--set start line address  Set Mapping RAM Display Start Line (0x00~0x3F)
-    OLED_WriteByte(0x81,OLED_CMD);//--set contrast control register
-    OLED_WriteByte(0xCF,OLED_CMD);// Set SEG Output Current Brightness
-    OLED_WriteByte(0xA1,OLED_CMD);//--Set SEG/Column Mapping     0xa0左右反置 0xa1正常
-    OLED_WriteByte(0xC8,OLED_CMD);//Set COM/Row Scan Direction   0xc0上下反置 0xc8正常
-    OLED_WriteByte(0xA6,OLED_CMD);//--set normal display
-    OLED_WriteByte(0xA8,OLED_CMD);//--set multiplex ratio(1 to 64)
-    OLED_WriteByte(0x3f,OLED_CMD);//--1/64 duty
-    OLED_WriteByte(0xD3,OLED_CMD);//-set display offset	Shift Mapping RAM Counter (0x00~0x3F)
-    OLED_WriteByte(0x00,OLED_CMD);//-not offset
-    OLED_WriteByte(0xd5,OLED_CMD);//--set display clock divide ratio/oscillator frequency
-    OLED_WriteByte(0x80,OLED_CMD);//--set divide ratio, Set Clock as 100 Frames/Sec
-    OLED_WriteByte(0xD9,OLED_CMD);//--set pre-charge period
-    OLED_WriteByte(0xF1,OLED_CMD);//Set Pre-Charge as 15 Clocks & Discharge as 1 Clock
-    OLED_WriteByte(0xDA,OLED_CMD);//--set com pins hardware configuration
-    OLED_WriteByte(0x12,OLED_CMD);
-    OLED_WriteByte(0xDB,OLED_CMD);//--set vcomh
-    OLED_WriteByte(0x40,OLED_CMD);//Set VCOM Deselect Level
-    OLED_WriteByte(0x20,OLED_CMD);//-Set Page Addressing Mode (0x00/0x01/0x02)
-    OLED_WriteByte(0x02,OLED_CMD);//
-    OLED_WriteByte(0x8D,OLED_CMD);//--set Charge Pump enable/disable
-    OLED_WriteByte(0x14,OLED_CMD);//--set(0x10) disable
-    OLED_WriteByte(0xA4,OLED_CMD);// Disable Entire Display On (0xa4/0xa5)
-    OLED_WriteByte(0xA6,OLED_CMD);// Disable Inverse Display On (0xa6/a7) 
-    //OLED_SPIFill(0x00);
-    OLED_WriteByte(0xAF,OLED_CMD);
-}
+        0xA1, 0xC8,       /* Segment and COM orientation. */
+        0xDA, 0x12,
+        0x81, 0xCF,       /* Contrast. */
+        0xD9, 0xF1,       /* Pre-charge. */
+        0xDB, 0x40,       /* VCOM level. */
+        0xA4, 0xA6,       /* RAM content, normal pixels. */
+        0xAF              /* Display on. */
+    };
+    oled_ready = 0;
+    oled_address = 0;
+    oled_error = OLED_ERROR_NOT_INITIALIZED;
+    OLED_I2CInit();
+    delay_ms(100);
 
+    if (OLED_StartWrite(0x3C)) {
+        oled_address = 0x3C;
+        OLED_StopTransfer();
+    } else if (OLED_StartWrite(0x3D)) {
+        oled_address = 0x3D;
+        OLED_StopTransfer();
+    } else {
+        return;
+    }
+
+    if (OLED_WriteBuffer(OLED_CONTROL_COMMAND, commands, (uint16_t)sizeof(commands))) {
+        oled_ready = 1;
+    }
+}
 
 void OLED_SendBuff(uint8_t buff[8][128])
-{		    
-	for(uint8_t i=0;i<8;i++)  
-	{  
-		OLED_WriteByte (0xb0+i,OLED_CMD);    //设置页地址（0~7）(b0-b7)
-#if (OLED_DRIVER == SSD1306)
-    OLED_WriteByte(0x00,OLED_CMD);//---set low column address
-#elif (OLED_DRIVER == SH1106)
-    OLED_WriteByte(0x02,OLED_CMD);//---set low column address
+{
+    uint8_t page;
+    uint8_t position[3];
+    if (!oled_ready) {
+        return;
+    }
+    for (page = 0; page < 8; ++page) {
+        position[0] = (uint8_t)(0xB0 | page);
+#if OLED_DRIVER == SSD1306
+        position[1] = 0x00;
+#else
+        position[1] = 0x02;
 #endif
-		OLED_WriteByte (0x10,OLED_CMD);      //设置显示位置—列高地址   
-		OLED_WriteByteArrayData(buff[i],128); //写一页128个字符
-	} //更新显示
+        position[2] = 0x10;
+        if (!OLED_WriteBuffer(OLED_CONTROL_COMMAND, position, 3) ||
+            !OLED_WriteBuffer(OLED_CONTROL_DATA, buff[page], 128)) {
+            oled_ready = 0;
+            return;
+        }
+    }
 }
+
+uint8_t OLED_IsReady(void) { return oled_ready; }
+uint8_t OLED_GetAddress(void) { return oled_address; }
+uint8_t OLED_GetLastError(void) { return oled_error; }
