@@ -1,0 +1,23 @@
+STM32 WouoUI Keil baseline / 原始示例整理版
+
+来源仓库：https://github.com/Sheep118/WouoUI-PageVersion
+原始文件：ProjectExamples/Stm32/C8T6_HWSPI_SSD1306_SH1106.zip
+Git blob SHA：3af1b0b113d754b665165698af231c28776b8f4b
+
+Keil 工程入口：USER\Template.uvprojx
+原工程目标芯片：STM32F103C8，64 KB Flash / 20 KB RAM。
+原示例使用 ARM Compiler 5 和 STM32F1xx 设备支持包。
+
+整理内容：
+1. 保留原压缩包中的源代码与 Keil 工程内容，不修改程序逻辑。
+2. 移除压缩包夹带的 .git 历史、旧编译结果和本机编辑器状态。
+3. 移除没有被工程调用的批处理清理脚本。
+4. 替换原 .gitignore，使驱动、核心和固件库源码都能正常提交。
+5. 附上来源仓库的 LICENSE；原有源码中的版权声明均保留。
+
+当前验证状态：已检查工程引用的源文件路径及复制完整性；尚未在本机 Keil 编译。
+下一个步骤是在你的 Keil 中打开工程，进行首次编译并读取 Build Output。
+
+显示适配说明：
+原始示例使用 SPI OLED，默认选择 SH1106；当前用户的四针屏需进一步适配。
+编译用于检查开发环境，接线与烧录将在屏幕驱动适配后进行。
