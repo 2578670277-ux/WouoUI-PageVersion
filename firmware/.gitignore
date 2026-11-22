@@ -1,0 +1,22 @@
+# Keil build outputs and local editor/debugger state
+OBJ/
+Objects/
+Listings/
+*.uvopt
+*.uvoptx
+*.uvgui.*
+*.uvguix.*
+*.bak
+*.o
+*.obj
+*.d
+*.dep
+*.crf
+*.axf
+*.elf
+*.hex
+*.bin
+*.map
+*.lnp
+*.lst
+*.build_log.htm
